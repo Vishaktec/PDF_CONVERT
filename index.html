@@ -767,30 +767,50 @@
           // it and run OCR instead of returning an empty sheet.
           ocrPages++;
           pg.textContent = `Page ${i} has no text layer — running OCR (this can take a bit)…`;
-          // 3x gives Tesseract enough resolution to reliably tell digits
-          // like 8/0/6 apart on small table text; 2x was too soft and
-          // produced the garbled characters seen in narrow numeric columns.
-          const viewport = page.getViewport({scale: 3});
+          // 4x gives Tesseract enough resolution to reliably tell digits
+          // like 8/0/6 apart on small table text.
+          const viewport = page.getViewport({scale: 4});
           const canvas = document.createElement('canvas');
           canvas.width = viewport.width; canvas.height = viewport.height;
           const ctx = canvas.getContext('2d');
           await page.render({canvasContext: ctx, viewport}).promise;
 
-          // Grayscale + contrast stretch: colored header/row banding
-          // (yellow header, light-blue stripes) hurts OCR accuracy far
-          // more than plain black-on-white text does.
-          const imgData = ctx.getImageData(0,0,canvas.width,canvas.height);
-          const d = imgData.data;
-          for(let p=0; p<d.length; p+=4){
-            const gray = 0.299*d[p] + 0.587*d[p+1] + 0.114*d[p+2];
-            const v = gray > 175 ? 255 : (gray < 90 ? 0 : gray); // stretch contrast
-            d[p]=d[p+1]=d[p+2]=v;
+          // Grayscale + unsharp-mask sharpening. A hard black/white cutoff
+          // (tried earlier) throws away the anti-aliased edge pixels that
+          // Tesseract actually relies on for small text, and made things
+          // worse. Sharpening (boost the difference between the image and
+          // a blurred copy of itself) keeps that detail while still making
+          // strokes crisper — tested directly against this file's OCR
+          // output and confirmed to measurably reduce misreads.
+          const gray = document.createElement('canvas');
+          gray.width = canvas.width; gray.height = canvas.height;
+          const gctx = gray.getContext('2d');
+          gctx.filter = 'grayscale(1)';
+          gctx.drawImage(canvas, 0, 0);
+
+          const blurred = document.createElement('canvas');
+          blurred.width = canvas.width; blurred.height = canvas.height;
+          const bctx = blurred.getContext('2d');
+          bctx.filter = 'blur(3px)';
+          bctx.drawImage(gray, 0, 0);
+
+          const sharpImg = gctx.getImageData(0,0,gray.width,gray.height);
+          const blurImg = bctx.getImageData(0,0,blurred.width,blurred.height);
+          const sd = sharpImg.data, bd = blurImg.data;
+          for(let p=0; p<sd.length; p+=4){
+            const v = Math.max(0, Math.min(255, sd[p]*1.6 - bd[p]*0.6));
+            sd[p]=sd[p+1]=sd[p+2]=v;
           }
-          ctx.putImageData(imgData, 0, 0);
+          gctx.putImageData(sharpImg, 0, 0);
 
           const worker = await getOcrWorker();
-          await worker.setParameters({ tessedit_pageseg_mode: '6' }); // uniform block of text (table)
-          const { data } = await worker.recognize(canvas);
+          // Sparse-text mode treats the page as scattered words rather than
+          // forcing everything into one flowing block — on this table it
+          // keeps each word its own bounding box instead of merging a whole
+          // row into a single giant box that swallows multiple columns,
+          // which was the real reason columns weren't splitting.
+          await worker.setParameters({ tessedit_pageseg_mode: '11' });
+          const { data } = await worker.recognize(gray);
           aoa = extractTable(itemsFromOcrWords(data.words), {rowTol:10, colGap:20, yAscending:true});
           if(aoa.length === 0 && data.text && data.text.trim()){
             // Fallback: OCR found text but bounding-box grouping produced
