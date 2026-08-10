@@ -370,6 +370,7 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf-autotable/3.8.2/jspdf.plugin.autotable.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/exceljs/4.4.0/exceljs.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5.0.4/dist/tesseract.min.js"></script>
 <script>
 (function(){
@@ -653,6 +654,19 @@
   function extractTable(items, {rowTol, colGap, yAscending}){
     if(items.length === 0) return [];
 
+    // Auto-scale the row/column thresholds to the text size actually present
+    // on this page, instead of trusting a fixed pixel value. OCR bounding
+    // boxes are in raster-canvas pixels, so their scale moves with whatever
+    // render scale was used — a fixed rowTol/colGap tuned for one scale
+    // silently breaks (rows merge, columns drift) at another.
+    const heights = items.map(it=> it.y1 !== undefined ? (it.y1-it.y0) : null).filter(h=> h && h > 0);
+    if(heights.length){
+      heights.sort((a,b)=>a-b);
+      const medianH = heights[Math.floor(heights.length/2)];
+      rowTol = Math.max(rowTol, medianH * 0.6);
+      colGap = Math.max(colGap, medianH * 1.2);
+    }
+
     // 1. Group items into visual rows, top to bottom.
     const sorted = items.slice().sort((a,b)=> yAscending ? a.y-b.y : b.y-a.y);
     const rows = [];
@@ -712,14 +726,21 @@
         x0: it.transform[4],
         x1: it.transform[4] + (it.width || it.str.length*5),
         y: it.transform[5],
+        y0: it.transform[5],
+        y1: it.transform[5] + (it.height || 10),
         text: it.str
       }))
       .filter(it=> it.text && it.text.trim() !== '');
   }
   function itemsFromOcrWords(words){
     return (words||[])
-      .map(w=>({ x0:w.bbox.x0, x1:w.bbox.x1, y:(w.bbox.y0+w.bbox.y1)/2, text:w.text }))
-      .filter(it=> it.text && it.text.trim() !== '');
+      .map(w=>({ x0:w.bbox.x0, x1:w.bbox.x1, y:(w.bbox.y0+w.bbox.y1)/2, y0:w.bbox.y0, y1:w.bbox.y1, text:w.text }))
+      .filter(it=> it.text && it.text.trim() !== '')
+      // Table gridlines are frequently misread by OCR as stray punctuation
+      // ("|", "[", "]", "_", "~", "-") sitting right in the whitespace gap
+      // between real columns. Left in, they bridge that gap and the
+      // column-boundary detector never sees it as a break. Drop them.
+      .filter(it=> !/^[|\[\]{}_~\-–—*="'.,]{1,2}$/.test(it.text.trim()));
   }
 
   $('go-p2e').addEventListener('click', async ()=>{
@@ -729,7 +750,7 @@
     try{
       const bytes = await p2eFile.arrayBuffer();
       const doc = await pdfjsLib.getDocument({data:new Uint8Array(bytes)}).promise;
-      const wb = XLSX.utils.book_new();
+      const wb = new ExcelJS.Workbook();
       let ocrPages = 0;
       for(let i=1;i<=doc.numPages;i++){
         pg.textContent = `Reading page ${i} of ${doc.numPages}…`;
@@ -746,13 +767,29 @@
           // it and run OCR instead of returning an empty sheet.
           ocrPages++;
           pg.textContent = `Page ${i} has no text layer — running OCR (this can take a bit)…`;
-          const viewport = page.getViewport({scale: 2});
+          // 3x gives Tesseract enough resolution to reliably tell digits
+          // like 8/0/6 apart on small table text; 2x was too soft and
+          // produced the garbled characters seen in narrow numeric columns.
+          const viewport = page.getViewport({scale: 3});
           const canvas = document.createElement('canvas');
           canvas.width = viewport.width; canvas.height = viewport.height;
           const ctx = canvas.getContext('2d');
           await page.render({canvasContext: ctx, viewport}).promise;
 
+          // Grayscale + contrast stretch: colored header/row banding
+          // (yellow header, light-blue stripes) hurts OCR accuracy far
+          // more than plain black-on-white text does.
+          const imgData = ctx.getImageData(0,0,canvas.width,canvas.height);
+          const d = imgData.data;
+          for(let p=0; p<d.length; p+=4){
+            const gray = 0.299*d[p] + 0.587*d[p+1] + 0.114*d[p+2];
+            const v = gray > 175 ? 255 : (gray < 90 ? 0 : gray); // stretch contrast
+            d[p]=d[p+1]=d[p+2]=v;
+          }
+          ctx.putImageData(imgData, 0, 0);
+
           const worker = await getOcrWorker();
+          await worker.setParameters({ tessedit_pageseg_mode: '6' }); // uniform block of text (table)
           const { data } = await worker.recognize(canvas);
           aoa = extractTable(itemsFromOcrWords(data.words), {rowTol:10, colGap:20, yAscending:true});
           if(aoa.length === 0 && data.text && data.text.trim()){
@@ -762,11 +799,42 @@
           }
         }
 
-        const ws = XLSX.utils.aoa_to_sheet(aoa);
-        XLSX.utils.book_append_sheet(wb, ws, `Page ${i}`.slice(0,31));
+        // Treat the first extracted row as the header (HSN CODE / DESCRIPTIONS /
+        // GST etc.) so it can be styled distinctly from the data rows below.
+        const ws = wb.addWorksheet(`Page ${i}`.slice(0,31));
+        aoa.forEach((row, rIdx)=>{
+          const wsRow = ws.addRow(row);
+          wsRow.eachCell({includeEmpty:true}, cell=>{
+            cell.border = {
+              top:{style:'thin', color:{argb:'FFBFBFBF'}},
+              left:{style:'thin', color:{argb:'FFBFBFBF'}},
+              bottom:{style:'thin', color:{argb:'FFBFBFBF'}},
+              right:{style:'thin', color:{argb:'FFBFBFBF'}}
+            };
+            cell.alignment = {vertical:'middle', wrapText:true};
+            if(rIdx === 0){
+              cell.font = {bold:true};
+              cell.fill = {type:'pattern', pattern:'solid', fgColor:{argb:'FFFFD966'}};
+              cell.alignment = {vertical:'middle', horizontal:'center'};
+            } else if(rIdx % 2 === 0){
+              cell.fill = {type:'pattern', pattern:'solid', fgColor:{argb:'FFDCEEF3'}};
+            }
+          });
+        });
+        // Auto-size columns from content, capped so long description
+        // columns don't blow out the sheet width.
+        ws.columns.forEach(col=>{
+          let maxLen = 10;
+          col.eachCell({includeEmpty:true}, cell=>{
+            const len = (cell.value||'').toString().length;
+            if(len > maxLen) maxLen = len;
+          });
+          col.width = Math.min(maxLen + 2, 60);
+        });
       }
       if(p2eOcrWorker){ await p2eOcrWorker.terminate(); p2eOcrWorker = null; }
-      XLSX.writeFile(wb, p2eFile.name.replace(/\.pdf$/i,'')+'.xlsx');
+      const outBytes = await wb.xlsx.writeBuffer();
+      downloadBlob(outBytes, p2eFile.name.replace(/\.pdf$/i,'')+'.xlsx', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
       pg.textContent = `Done — ${doc.numPages} sheet(s) created${ocrPages ? ` (${ocrPages} via OCR)` : ''}.`;
       toast('PDF converted to Excel');
     }catch(err){
